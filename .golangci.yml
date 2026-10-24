@@ -10,6 +10,11 @@ linters:
   settings:
     errorlint:
       errorf: true
+    errcheck:
+      # Deferred rollback/close after an earlier error check is the idiom; nothing to do with the error.
+      exclude-functions:
+        - (github.com/jackc/pgx/v5.Tx).Rollback
+        - (*github.com/jackc/pgx/v5.Conn).Close
 
 formatters:
   enable:

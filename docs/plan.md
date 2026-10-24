@@ -29,6 +29,9 @@ Each becomes a failing test first, then a fix.
 - `ErrQuota` / SQLSTATE `MD005` exists but nothing enforces quotas (v0.2).
 - `expand` and relation validation never check the target collection in field options (v0.2).
 - Module path, Go version and pgx are stale. Target Go 1.26 and pgx v5.11.
+- `Tenant.Delete` never worked: under `QueryExecModeExec` (required behind a transaction-mode
+  pooler) pgx cannot encode `[]uuid.UUID` as `uuid[]` without a prepared statement. Found by
+  the new suite; the v0 tests never called Delete.
 - All tests skip without a test DSN, so `go test ./...` passes vacuously on a fresh clone.
 - README and the HTTP example are specific to the original host project.
 
@@ -55,12 +58,14 @@ a test that defines a stub `auth.uid()` and a role named `authenticated`.
 
 1. **Bootstrap** (this commit): license, README stub, module, Makefile, lint config,
    CI on `ubuntu-latest`, this plan.
-2. **Tests first** (PR): port the five existing tests onto the harness; add regression
+2. **Tests first** (PR #1): port the five existing tests onto the harness; add regression
    tests for each defect above, plus concurrent `Ensure` callers, the Supabase role
-   path, cursors over null sort values and a golden file for `cmd/multidb-sql`. The v0
-   library is ported unchanged in the same PR so the suite compiles; the new tests are
-   red. Stop and ask the owner to validate the tests.
-3. **Fixes** (PR): fix the defects until the suite is green and `golangci-lint` is clean.
+   path and cursors over null sort values. The v0 library is ported with only the
+   rename and lint-driven `errors.Is` changes so the suite compiles; the defect tests
+   are red. Stop and ask the owner to validate the tests.
+3. **Fixes** (same PR, after validation): fix the defects until the suite is green, so
+   `main` never carries a red build. The `cmd/multidb-sql` golden test arrives with the
+   command in phase 4.
 4. **Examples and docs** (PR): generalize the HTTP example behind an `Authenticator`
    interface; write `docs/spec.md` (query contract v1), `docs/supabase.md` (pooler,
    roles, `rpc()`), `docs/security.md` (RLS model, never query as superuser);
@@ -72,4 +77,7 @@ one Codex review per PR.
 
 ## Progress
 
-- ✅ Phase 1 bootstrap.
+- ✅ Phase 1 bootstrap; CI green on hosted Actions.
+- 🚧 Phase 2 tests-first PR open: 18 tests over the embedded Postgres harness, 5 red by
+  design (bad collection id, null-sort pagination asc/desc, statement timeout clobbered,
+  Delete encoding in two tests). Awaiting owner validation before fixes.
