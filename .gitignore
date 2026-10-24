@@ -1,0 +1,15 @@
+# Build and test output
+dist/
+*.test
+*.out
+coverage.html
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local environment
+.env
+.env.*
+!.env.example
