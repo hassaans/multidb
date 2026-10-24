@@ -226,13 +226,13 @@ func TestCrossTenantIsolation(t *testing.T) {
 		t.Fatalf("tenant a lost rows: %d", n)
 	}
 
-	// No tenant at all: RLS must yield nothing rather than everything.
+	// No tenant at all is a caller bug: refused before touching the database.
 	none := s.Tenant("")
-	if dbs, err := none.ListDatabases(ctx); err != nil || len(dbs) != 0 {
-		t.Fatalf("empty tenant should see nothing, got %d, %v", len(dbs), err)
+	if _, err := none.ListDatabases(ctx); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("empty tenant read: want ErrForbidden, got %v", err)
 	}
-	if _, err := none.CreateDatabase(ctx, "x"); err == nil {
-		t.Fatal("empty tenant should not be able to create a database")
+	if _, err := none.CreateDatabase(ctx, "x"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("empty tenant write: want ErrForbidden, got %v", err)
 	}
 }
 

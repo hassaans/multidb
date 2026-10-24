@@ -33,6 +33,25 @@ Each becomes a failing test first, then a fix.
   pooler) pgx cannot encode `[]uuid.UUID` as `uuid[]` without a prepared statement. Found by
   the new suite; the v0 tests never called Delete.
 - All tests skip without a test DSN, so `go test ./...` passes vacuously on a fresh clone.
+
+Found by Codex's review of PR #1 (each also has a red test):
+
+- **Parent ownership (P1).** Foreign keys are checked as the table owner and ignore RLS,
+  so tenant B can create collections under A's database and fields on A's collections.
+  Fix: tenant-inclusive composite foreign keys.
+- **Empty tenant (P1).** On plain Postgres `current_tenant()` returns `''` for an empty
+  `app.tenant_id`, which makes `''` a shared namespace. Fix: `nullif`, plus the Go side
+  refuses an empty tenant id with `ErrForbidden`.
+- Document fields named `id`, `created_at` or `updated_at` overwrite record metadata in
+  results and break cursors. Fix: reserve the names and keep metadata authoritative.
+- Sorting by a `json`/`relation_many` field works for one page and fails on the next
+  (jsonb vs text keyset). Fix: reject with `ErrTypeMismatch`.
+- `jsonb_strip_nulls` is recursive, so nulls nested inside `json` values are lost on
+  write. Fix: strip top-level nulls only.
+- `snapshot_usage()` starts from collections, so a database whose collections were all
+  deleted keeps its stale snapshot. Fix: start from databases.
+- Unique violations, check violations and RLS refusals surface as raw Postgres errors.
+  Fix: map to `ErrConflict`, `ErrBadSpec` and `ErrForbidden`.
 - README and the HTTP example are specific to the original host project.
 
 ### Layout
@@ -78,6 +97,9 @@ one Codex review per PR.
 ## Progress
 
 - ✅ Phase 1 bootstrap; CI green on hosted Actions.
-- 🚧 Phase 2 tests-first PR open: 18 tests over the embedded Postgres harness, 5 red by
-  design (bad collection id, null-sort pagination asc/desc, statement timeout clobbered,
-  Delete encoding in two tests). Awaiting owner validation before fixes.
+- 🚧 Phase 2 tests-first PR #1 open: 27 tests over the embedded Postgres harness, CI
+  green except the test step. 13 red by design: bad collection id, null-sort pagination
+  asc/desc, statement timeout clobbered, Delete encoding (two tests), parent ownership,
+  empty tenant, duplicate-name conflicts, reserved field names, sort by json, nested
+  nulls, stale snapshot. Codex reviewed once (6 findings, all turned into tests).
+  Awaiting owner validation before fixes.

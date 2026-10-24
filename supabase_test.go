@@ -43,6 +43,16 @@ func TestSupabaseAuthenticatedRole(t *testing.T) {
 		}
 	}
 	admin.Close(ctx)
+	t.Cleanup(func() {
+		admin, err := pgx.Connect(ctx, pgtest.AdminDSN(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer admin.Close(ctx)
+		if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS auth CASCADE`); err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	// Ensure runs after the role exists, so the migration grants to `authenticated`.
 	s := testStore(t)

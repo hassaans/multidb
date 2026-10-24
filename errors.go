@@ -16,6 +16,8 @@ var (
 	ErrQuota           = errors.New("multidb: quota exceeded")
 	ErrNotFound        = errors.New("multidb: not found")
 	ErrBadSpec         = errors.New("multidb: bad spec")
+	ErrConflict        = errors.New("multidb: conflict")  // duplicate name
+	ErrForbidden       = errors.New("multidb: forbidden") // no tenant, or RLS refused the write
 	ErrNotInstalled    = errors.New("multidb: schema not installed; call Ensure")
 )
 
