@@ -15,6 +15,9 @@ linters:
       exclude-functions:
         - (github.com/jackc/pgx/v5.Tx).Rollback
         - (*github.com/jackc/pgx/v5.Conn).Close
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
 
 formatters:
   enable:

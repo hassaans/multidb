@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -33,8 +34,7 @@ func TestEnsureIsIdempotentAndConcurrent(t *testing.T) {
 	}
 
 	// Many cold starts at once must serialise on the advisory lock and install exactly once.
-	schema := newSchemaName()
-	t.Cleanup(func() { dropSchema(t, schema) })
+	schema := pgtest.NewSchema(t)
 	const n = 8
 	var wg sync.WaitGroup
 	errs := make([]error, n)
@@ -167,5 +167,58 @@ func TestErrorWrapping(t *testing.T) {
 	e := &Error{Kind: ErrNotFound, Message: "collection not found"}
 	if !errors.Is(e, ErrNotFound) || e.Error() != "multidb: not found: collection not found" {
 		t.Fatalf("Error formatting/unwrapping wrong: %q", e.Error())
+	}
+}
+
+// SQL(schema) is what `multidb-sql` prints for `supabase db push` and friends. Applying it
+// must install exactly what Ensure installs, record the versions, and be re-runnable.
+func TestSQLExportInstalls(t *testing.T) {
+	ctx := context.Background()
+	if _, err := SQL("has-dash"); err == nil {
+		t.Fatal("invalid schema name must be rejected")
+	}
+	schema := pgtest.NewSchema(t)
+	out, err := SQL(schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "{{schema}}") {
+		t.Fatal("placeholder left in output")
+	}
+	if !strings.Contains(out, "CREATE SCHEMA IF NOT EXISTS "+schema) {
+		t.Fatal("output does not create the schema")
+	}
+
+	admin, err := pgx.Connect(ctx, pgtest.AdminDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	for i := 0; i < 2; i++ { // idempotent: a second apply is a no-op
+		if _, err := admin.Exec(ctx, out); err != nil {
+			t.Fatalf("apply %d: %v", i+1, err)
+		}
+	}
+	s, err := Open(ctx, pgtest.AppDSN(t), WithSchema(schema), WithAdminDSN(pgtest.AdminDSN(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	migrations, _ := loadMigrations()
+	if v, err := s.Version(ctx); err != nil || v != migrations[len(migrations)-1].version {
+		t.Fatalf("version after SQL export: %d %v", v, err)
+	}
+	var rows int
+	if err := admin.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s._schema`, s.ident(schema))).Scan(&rows); err != nil || rows != len(migrations) {
+		t.Fatalf("_schema rows: %d %v", rows, err)
+	}
+	if err := s.Ensure(ctx); err != nil {
+		t.Fatalf("Ensure after SQL export should be a no-op: %v", err)
+	}
+	// The installed functions work end to end as the app role.
+	tn := s.Tenant("t1")
+	sd := seed(t, tn)
+	if n := count(t, tn, QuerySpec{Collection: sd.Orders.String()}); n != 3 {
+		t.Fatalf("query on exported schema: %d", n)
 	}
 }
