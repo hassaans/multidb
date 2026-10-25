@@ -101,6 +101,9 @@ one Codex review per PR.
   design. Codex reviewed once (6 findings, all turned into tests). Tests validated by the
   owner on 25 Oct; decisions: empty tenant id is refused with `ErrForbidden`, schema
   fixes edit `001_init.sql` in place since nothing is released.
+- ✅ Phase 5 release: `v0.1.0` tagged from the squash merge of PR #2, GitHub release
+  published, pkg.go.dev indexed, tracking issue opened for the v0.2 items (quotas,
+  relation target validation, multi-direction sort, per-field indexes).
 - ✅ Phase 4 examples and docs (PR #2): tests first for `multidb.SQL`, `cmd/multidb-sql`
   and `examples/httpserver`, validated by the owner, then implemented; README,
   `docs/spec.md`, `docs/supabase.md`, `docs/security.md`, `CONTRIBUTING.md`,
