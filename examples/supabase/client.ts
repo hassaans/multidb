@@ -74,7 +74,7 @@ export class MultiDB {
 
   /** Iterate every page of a query. */
   async *pages<Row = Record<string, unknown>>(spec: QuerySpec) {
-    let cursor: string | undefined
+    let cursor = spec.cursor
     do {
       const page = await this.query<Row>({ ...spec, cursor })
       yield page.rows

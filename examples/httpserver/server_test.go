@@ -26,7 +26,11 @@ type client struct {
 func (c client) call(method, path string, body any) (int, map[string]any) {
 	c.t.Helper()
 	var buf bytes.Buffer
-	if body != nil {
+	switch b := body.(type) {
+	case nil:
+	case json.RawMessage: // sent as is, so malformed bodies stay malformed
+		buf.Write(b)
+	default:
 		if err := json.NewEncoder(&buf).Encode(body); err != nil {
 			c.t.Fatal(err)
 		}
@@ -138,7 +142,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 	a.want(http.StatusBadRequest, "POST", "/v1/query", map[string]any{"collection": colID, "filter": map[string]any{"nope": 1}})
 	a.want(http.StatusUnprocessableEntity, "POST", "/v1/query", map[string]any{"collection": colID, "limit": 999999})
-	a.want(http.StatusBadRequest, "POST", "/v1/query", bytes.NewBufferString("{not json"))
+	a.want(http.StatusBadRequest, "POST", "/v1/query", json.RawMessage("{not json"))
 
 	// Isolation: tenant b sees none of it.
 	b.want(http.StatusNotFound, "POST", "/v1/query", map[string]any{"collection": colID})

@@ -12,39 +12,44 @@
 package main
 
 import (
-	"errors"
+	"context"
+	"log"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/hassaans/multidb"
 )
 
-// Authenticator resolves the tenant a request acts for.
-type Authenticator interface {
-	Tenant(r *http.Request) (string, error)
+func main() {
+	ctx := context.Background()
+	tokens, err := ParseStaticTokens(os.Getenv("MULTIDB_TOKENS"))
+	if err != nil {
+		log.Fatalf("MULTIDB_TOKENS: %v", err)
+	}
+	opts := []multidb.Option{multidb.WithMaxConns(4)}
+	if s := os.Getenv("MULTIDB_SCHEMA"); s != "" {
+		opts = append(opts, multidb.WithSchema(s))
+	}
+	if a := os.Getenv("MULTIDB_ADMIN_DSN"); a != "" {
+		opts = append(opts, multidb.WithAdminDSN(a))
+	}
+	store, err := multidb.Open(ctx, os.Getenv("MULTIDB_DSN"), opts...)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer store.Close()
+	ectx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	if err := store.Ensure(ectx); err != nil {
+		log.Fatal(err)
+	}
+	cancel()
+
+	addr := ":8080"
+	if p := os.Getenv("PORT"); p != "" {
+		addr = ":" + p
+	}
+	srv := &http.Server{Addr: addr, Handler: NewHandler(store, tokens), ReadHeaderTimeout: 10 * time.Second}
+	log.Printf("listening on %s", addr)
+	log.Fatal(srv.ListenAndServe())
 }
-
-// StaticTokens maps bearer tokens to tenant ids. Good enough for a demo or a single
-// trusted client; replace it with JWT or API-key verification in production.
-type StaticTokens map[string]string
-
-// Tenant implements Authenticator.
-func (s StaticTokens) Tenant(*http.Request) (string, error) {
-	return "", errors.New("not implemented")
-}
-
-// ParseStaticTokens parses "token=tenant,token=tenant".
-func ParseStaticTokens(string) (StaticTokens, error) {
-	return nil, errors.New("not implemented")
-}
-
-// NewHandler mounts the API on a new ServeMux.
-func NewHandler(*multidb.Store, Authenticator) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, `{"error":"not implemented"}`, http.StatusNotImplemented)
-	})
-}
-
-// statusFor maps the package's typed errors to HTTP status codes.
-func statusFor(error) int { return http.StatusNotImplemented }
-
-func main() {}
