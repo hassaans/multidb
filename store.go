@@ -263,3 +263,11 @@ func (s *Store) Usage(ctx context.Context, databaseID string, from, to time.Time
 	}
 	return u, wrap(err)
 }
+
+// SQL returns the complete, idempotent installation script for one schema: every
+// migration with the schema name substituted, plus the version bookkeeping that makes a
+// later Ensure a no-op. Use it where Go cannot run the migrations itself, for example
+// `multidb-sql > supabase/migrations/<timestamp>_multidb.sql` followed by `supabase db push`.
+func SQL(schema string) (string, error) {
+	return "", fmt.Errorf("multidb: SQL export not implemented")
+}
