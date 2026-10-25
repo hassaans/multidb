@@ -50,8 +50,17 @@ func wrap(err error) error {
 		if kind, ok := sqlstateKinds[pgErr.Code]; ok {
 			return &Error{Kind: kind, Message: pgErr.Message}
 		}
-		if pgErr.Code == "57014" { // query_canceled: statement_timeout
+		switch pgErr.Code {
+		case "57014": // query_canceled: statement_timeout
 			return &Error{Kind: ErrLimitExceeded, Message: "statement timeout"}
+		case "23505": // unique_violation: a name already taken within its parent
+			return &Error{Kind: ErrConflict, Message: "duplicate name"}
+		case "23503": // foreign_key_violation: the parent is missing or belongs to another tenant
+			return &Error{Kind: ErrNotFound, Message: "parent not found"}
+		case "23514": // check_violation: invalid name, type or reserved name
+			return &Error{Kind: ErrBadSpec, Message: "invalid value: " + pgErr.ConstraintName}
+		case "42501": // insufficient_privilege: RLS refused the row
+			return &Error{Kind: ErrForbidden, Message: "not permitted for this tenant"}
 		}
 	}
 	return err

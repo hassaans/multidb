@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,22 +28,21 @@ func (t *Tenant) ID() string { return t.id }
 
 // run executes fn in a transaction scoped to this tenant.
 func (t *Tenant) run(ctx context.Context, fn func(pgx.Tx) error) error {
+	if strings.TrimSpace(t.id) == "" {
+		return &Error{Kind: ErrForbidden, Message: "empty tenant id"}
+	}
 	tx, err := t.s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	// SET LOCAL dies with the transaction, so it never leaks across pooled connections.
-	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true)`, t.id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, fmt.Sprintf(`SET LOCAL statement_timeout = '%dms'`, t.s.timeout.Milliseconds())); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('multidb.max_limit', $1, true)`, fmt.Sprint(t.s.maxLimit)); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `SELECT set_config('multidb.max_groups', $1, true)`, fmt.Sprint(t.s.maxGroups)); err != nil {
+	// One round trip for every transaction-local setting. set_config(..., true) dies
+	// with the transaction, so nothing leaks across pooled connections.
+	if _, err := tx.Exec(ctx, `SELECT set_config('app.tenant_id', $1, true),
+	                                 set_config('statement_timeout', $2, true),
+	                                 set_config('multidb.max_limit', $3, true),
+	                                 set_config('multidb.max_groups', $4, true)`,
+		t.id, fmt.Sprintf("%dms", t.s.timeout.Milliseconds()), fmt.Sprint(t.s.maxLimit), fmt.Sprint(t.s.maxGroups)); err != nil {
 		return err
 	}
 	if err := fn(tx); err != nil {
@@ -329,10 +329,16 @@ func (t *Tenant) Update(ctx context.Context, collectionID, id uuid.UUID, patch j
 
 // Delete removes the given records and reports how many existed.
 func (t *Tenant) Delete(ctx context.Context, collectionID uuid.UUID, ids []uuid.UUID) (int64, error) {
+	// Without prepared statements pgx cannot infer uuid[] for []uuid.UUID, so the ids
+	// travel as text[] and Postgres casts.
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = id.String()
+	}
 	var n int64
 	err := t.run(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx, fmt.Sprintf(`SELECT %s($1, $2)`, t.s.fn("delete_records")),
-			collectionID, ids).Scan(&n)
+		return tx.QueryRow(ctx, fmt.Sprintf(`SELECT %s($1, $2::uuid[])`, t.s.fn("delete_records")),
+			collectionID, strs).Scan(&n)
 	})
 	return n, err
 }
@@ -342,7 +348,7 @@ func (t *Tenant) Get(ctx context.Context, collectionID, id uuid.UUID) (json.RawM
 	var doc json.RawMessage
 	err := t.run(ctx, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, fmt.Sprintf(`
-			SELECT jsonb_build_object('id', id, 'created_at', created_at, 'updated_at', updated_at) || data
+			SELECT data || jsonb_build_object('id', id, 'created_at', created_at, 'updated_at', updated_at)
 			  FROM %s WHERE collection_id = $1 AND id = $2`, t.s.fn("records")),
 			collectionID, id).Scan(&doc)
 		if errors.Is(err, pgx.ErrNoRows) {

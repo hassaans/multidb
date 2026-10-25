@@ -21,27 +21,34 @@ CREATE TABLE IF NOT EXISTS {{schema}}._schema (
   applied_at  timestamptz NOT NULL DEFAULT now()
 );
 
+-- Child tables reference (parent_id, tenant_id) rather than parent_id alone. Foreign
+-- keys are checked as the table owner and ignore RLS, so without the tenant in the key a
+-- tenant could attach its own rows to another tenant's parent whose id it guessed.
 CREATE TABLE IF NOT EXISTS {{schema}}.databases (
   id          uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id   text        NOT NULL,
   name        text        NOT NULL,
   settings    jsonb       NOT NULL DEFAULT '{}'::jsonb,
   created_at  timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (tenant_id, name)
+  UNIQUE (tenant_id, name),
+  UNIQUE (id, tenant_id)
 );
 
 CREATE TABLE IF NOT EXISTS {{schema}}.collections (
   id           uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  database_id  uuid        NOT NULL REFERENCES {{schema}}.databases(id) ON DELETE CASCADE,
+  database_id  uuid        NOT NULL,
   tenant_id    text        NOT NULL,
   name         text        NOT NULL,
   created_at   timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (database_id, name)
+  UNIQUE (database_id, name),
+  UNIQUE (id, tenant_id),
+  FOREIGN KEY (database_id, tenant_id) REFERENCES {{schema}}.databases(id, tenant_id) ON DELETE CASCADE
 );
 
+-- id, created_at and updated_at are record metadata and cannot be shadowed by a field.
 CREATE TABLE IF NOT EXISTS {{schema}}.fields (
   id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  collection_id  uuid        NOT NULL REFERENCES {{schema}}.collections(id) ON DELETE CASCADE,
+  collection_id  uuid        NOT NULL,
   tenant_id      text        NOT NULL,
   name           text        NOT NULL,
   type           text        NOT NULL CHECK (type IN
@@ -49,16 +56,19 @@ CREATE TABLE IF NOT EXISTS {{schema}}.fields (
   options        jsonb       NOT NULL DEFAULT '{}'::jsonb,
   position       int         NOT NULL DEFAULT 0,
   UNIQUE (collection_id, name),
-  CHECK (name ~ '^[a-zA-Z_][a-zA-Z0-9_]{0,62}$')
+  CHECK (name ~ '^[a-zA-Z_][a-zA-Z0-9_]{0,62}$'),
+  CHECK (name NOT IN ('id', 'created_at', 'updated_at')),
+  FOREIGN KEY (collection_id, tenant_id) REFERENCES {{schema}}.collections(id, tenant_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS {{schema}}.records (
   id             uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
-  collection_id  uuid        NOT NULL REFERENCES {{schema}}.collections(id) ON DELETE CASCADE,
+  collection_id  uuid        NOT NULL,
   tenant_id      text        NOT NULL,
   data           jsonb       NOT NULL DEFAULT '{}'::jsonb,
   created_at     timestamptz NOT NULL DEFAULT now(),
-  updated_at     timestamptz NOT NULL DEFAULT now()
+  updated_at     timestamptz NOT NULL DEFAULT now(),
+  FOREIGN KEY (collection_id, tenant_id) REFERENCES {{schema}}.collections(id, tenant_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS records_collection_idx ON {{schema}}.records (collection_id, created_at, id);
@@ -68,36 +78,39 @@ CREATE INDEX IF NOT EXISTS collections_tenant_idx ON {{schema}}.collections (ten
 CREATE INDEX IF NOT EXISTS fields_tenant_idx      ON {{schema}}.fields (tenant_id);
 
 CREATE TABLE IF NOT EXISTS {{schema}}.usage_daily (
-  database_id  uuid NOT NULL REFERENCES {{schema}}.databases(id) ON DELETE CASCADE,
+  database_id  uuid NOT NULL,
   tenant_id    text NOT NULL,
   day          date NOT NULL,
   reads        bigint NOT NULL DEFAULT 0,
   writes       bigint NOT NULL DEFAULT 0,
   rows_out     bigint NOT NULL DEFAULT 0,
-  PRIMARY KEY (database_id, day)
+  PRIMARY KEY (database_id, day),
+  FOREIGN KEY (database_id, tenant_id) REFERENCES {{schema}}.databases(id, tenant_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS {{schema}}.usage_snapshot (
-  database_id  uuid NOT NULL REFERENCES {{schema}}.databases(id) ON DELETE CASCADE,
+  database_id  uuid NOT NULL,
   tenant_id    text NOT NULL,
   day          date NOT NULL,
   bytes        bigint NOT NULL,
   records      bigint NOT NULL,
-  PRIMARY KEY (database_id, day)
+  PRIMARY KEY (database_id, day),
+  FOREIGN KEY (database_id, tenant_id) REFERENCES {{schema}}.databases(id, tenant_id) ON DELETE CASCADE
 );
 
--- Tenant resolution: a session setting (Lambda path) or Supabase Auth (RPC path).
+-- Tenant resolution: a session setting (Go path) or Supabase Auth (RPC path).
 -- auth.uid() is referenced dynamically so this installs on plain Postgres too.
+-- An empty or blank setting is no tenant, never a shared '' namespace.
 CREATE OR REPLACE FUNCTION {{schema}}.current_tenant() RETURNS text
 LANGUAGE plpgsql STABLE AS $$
 DECLARE t text;
 BEGIN
-  t := current_setting('app.tenant_id', true);
-  IF t IS NOT NULL AND t <> '' THEN RETURN t; END IF;
+  t := nullif(btrim(coalesce(current_setting('app.tenant_id', true), '')), '');
+  IF t IS NOT NULL THEN RETURN t; END IF;
   IF to_regproc('auth.uid') IS NOT NULL THEN
     EXECUTE 'SELECT auth.uid()::text' INTO t;
   END IF;
-  RETURN t;  -- NULL means no tenant: every RLS policy evaluates false
+  RETURN nullif(t, '');  -- NULL means no tenant: every RLS policy evaluates false
 END $$;
 
 -- RLS on every tenant table, same policy shape.

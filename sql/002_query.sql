@@ -53,6 +53,13 @@ BEGIN
   RETURN fields->fname->>'type';
 END $$;
 
+-- Drop top-level null fields only. Nulls nested inside a json value are data.
+CREATE OR REPLACE FUNCTION {{schema}}._strip_top_nulls(doc jsonb) RETURNS jsonb
+LANGUAGE sql IMMUTABLE AS $$
+  SELECT coalesce(jsonb_object_agg(key, value) FILTER (WHERE jsonb_typeof(value) <> 'null'), '{}'::jsonb)
+    FROM jsonb_each(doc)
+$$;
+
 -- Validate a document (or patch) against the collection's fields.
 CREATE OR REPLACE FUNCTION {{schema}}._validate_doc(doc jsonb, fields jsonb) RETURNS void
 LANGUAGE plpgsql IMMUTABLE AS $$
@@ -207,10 +214,10 @@ DECLARE
   params jsonb := '[]'::jsonb; fsql jsonb; where_sql text;
   max_limit int := coalesce(nullif(current_setting('multidb.max_limit', true), ''), '1000')::int;
   max_groups int := coalesce(nullif(current_setting('multidb.max_groups', true), ''), '10000')::int;
-  stmt_timeout text := coalesce(nullif(current_setting('multidb.statement_timeout', true), ''), '5s');
+  stmt_timeout text := nullif(current_setting('multidb.statement_timeout', true), '');
   lim int; sort_items jsonb; s jsonb; sort_exprs text[] := '{}'; sort_dirs text[] := '{}';
-  sort_fields text[] := '{}'; dir text; ftype text;
-  cursor_vals jsonb; cursor_sql text := ''; idx int;
+  sort_fields text[] := '{}'; dir text; nulls_sql text; ftype text;
+  cursor_vals jsonb; cursor_sql text := ''; idx int; vexprs text[] := '{}'; ks_parts text[] := '{}'; eqs text; i int; j int; n_sort int;
   expand_items jsonb; e text; ename text; eopts jsonb; expand_sql text := '';
   group_items jsonb; agg_items jsonb; g text; aname text; aspec jsonb; afn text; afield text;
   group_exprs text[] := '{}'; sel_pairs text[] := '{}'; group_count bigint;
@@ -219,11 +226,21 @@ BEGIN
   IF coalesce((spec->>'v')::int, 0) <> 1 THEN
     RAISE EXCEPTION USING ERRCODE = 'MD007', MESSAGE = 'unsupported spec version';
   END IF;
-  cid := (spec->>'collection')::uuid;
+  BEGIN
+    cid := (spec->>'collection')::uuid;
+  EXCEPTION WHEN invalid_text_representation THEN
+    RAISE EXCEPTION USING ERRCODE = 'MD007', MESSAGE = 'collection must be a uuid';
+  END;
+  IF cid IS NULL THEN
+    RAISE EXCEPTION USING ERRCODE = 'MD007', MESSAGE = 'collection is required';
+  END IF;
   meta := {{schema}}._fields_for(cid);
   fields := meta.fields;
 
-  EXECUTE format('SET LOCAL statement_timeout = %L', stmt_timeout);
+  -- The Go side sets statement_timeout itself; this is for callers that have no Go side.
+  IF stmt_timeout IS NOT NULL THEN
+    EXECUTE format('SET LOCAL statement_timeout = %L', stmt_timeout);
+  END IF;
 
   -- WHERE
   fsql := {{schema}}._filter_sql(spec->'filter', fields, params);
@@ -303,6 +320,9 @@ BEGIN
   dir := NULL;
   FOR s IN SELECT * FROM jsonb_array_elements(sort_items) LOOP
     ftype := {{schema}}._field_type(fields, s->>'field');
+    IF ftype IN ('json', 'relation_many') THEN
+      RAISE EXCEPTION USING ERRCODE = 'MD003', MESSAGE = format('cannot sort by %s field %s', ftype, s->>'field');
+    END IF;
     IF dir IS NOT NULL AND dir <> lower(coalesce(s->>'dir', 'asc')) THEN
       RAISE EXCEPTION USING ERRCODE = 'MD007', MESSAGE = 'v1 sort fields must share one direction';
     END IF;
@@ -319,6 +339,7 @@ BEGIN
     sort_fields := ARRAY['created_at'];
   END IF;
   sort_exprs := array_append(sort_exprs, 'r.id');
+  nulls_sql := CASE dir WHEN 'asc' THEN 'NULLS LAST' ELSE 'NULLS FIRST' END;
 
   -- Keyset cursor: a JSON array of the last row's sort values followed by its id.
   IF spec ? 'cursor' AND spec->>'cursor' IS NOT NULL THEN
@@ -331,14 +352,29 @@ BEGIN
       RAISE EXCEPTION USING ERRCODE = 'MD007', MESSAGE = 'cursor does not match sort';
     END IF;
     idx := jsonb_array_length(params);
-    cursor_sql := format(' AND (%s) %s (%s)',
-      array_to_string(sort_exprs, ', '),
-      CASE dir WHEN 'asc' THEN '>' ELSE '<' END,
-      (SELECT string_agg(
-         CASE WHEN i = array_length(sort_exprs, 1) THEN format('($1->%s->>%s)::uuid', idx, i - 1)
-              WHEN sort_fields[i] = 'created_at' THEN format('($1->%s->>%s)::timestamptz', idx, i - 1)
-              ELSE {{schema}}._cast(format('($1->%s->>%s)', idx, i - 1), fields->sort_fields[i]->>'type') END, ', ')
-       FROM generate_series(1, array_length(sort_exprs, 1)) i));
+    n_sort := array_length(sort_exprs, 1);
+    -- Typed expressions for the cursor's values; the last one is always the row id.
+    FOR i IN 1..n_sort LOOP
+      vexprs[i] := CASE
+        WHEN i = n_sort THEN format('($1->%s->>%s)::uuid', idx, i - 1)
+        WHEN sort_fields[i] = 'created_at' THEN format('($1->%s->>%s)::timestamptz', idx, i - 1)
+        ELSE {{schema}}._cast(format('($1->%s->>%s)', idx, i - 1), fields->sort_fields[i]->>'type') END;
+    END LOOP;
+    -- Lexicographic "after the cursor row" written out explicitly, because a row
+    -- comparison yields NULL (and drops the row) as soon as one sort value is NULL.
+    -- asc orders NULLS LAST, desc NULLS FIRST, matching ORDER BY below.
+    FOR i IN 1..n_sort LOOP
+      eqs := '';
+      FOR j IN 1..i - 1 LOOP
+        eqs := eqs || format('(%s) IS NOT DISTINCT FROM (%s) AND ', sort_exprs[j], vexprs[j]);
+      END LOOP;
+      ks_parts := ks_parts || format('(%s%s)', eqs, CASE dir
+        WHEN 'asc' THEN format('((%s) > (%s) OR ((%s) IS NULL AND (%s) IS NOT NULL))',
+                               sort_exprs[i], vexprs[i], sort_exprs[i], vexprs[i])
+        ELSE            format('((%s) < (%s) OR ((%s) IS NOT NULL AND (%s) IS NULL))',
+                               sort_exprs[i], vexprs[i], sort_exprs[i], vexprs[i]) END);
+    END LOOP;
+    cursor_sql := ' AND (' || array_to_string(ks_parts, ' OR ') || ')';
     params := params || jsonb_build_array(cursor_vals);
   END IF;
 
@@ -348,9 +384,9 @@ BEGIN
     ename := split_part(e, '.', 1);  -- nested paths are accepted but only the first hop is expanded in v1
     ftype := {{schema}}._field_type(fields, ename);
     IF ftype = 'relation' THEN
-      expand_sql := expand_sql || format(' || jsonb_build_object(%L, (SELECT jsonb_build_object(''id'', x.id) || x.data FROM {{schema}}.records x WHERE x.id = (r.data->>%L)::uuid))', ename, ename);
+      expand_sql := expand_sql || format(' || jsonb_build_object(%L, (SELECT x.data || jsonb_build_object(''id'', x.id) FROM {{schema}}.records x WHERE x.id = (r.data->>%L)::uuid))', ename, ename);
     ELSIF ftype = 'relation_many' THEN
-      expand_sql := expand_sql || format(' || jsonb_build_object(%L, (SELECT coalesce(jsonb_agg(jsonb_build_object(''id'', x.id) || x.data), ''[]''::jsonb) FROM {{schema}}.records x WHERE x.id IN (SELECT v::uuid FROM jsonb_array_elements_text(coalesce(r.data->%L, ''[]''::jsonb)) AS t(v))))', ename, ename);
+      expand_sql := expand_sql || format(' || jsonb_build_object(%L, (SELECT coalesce(jsonb_agg(x.data || jsonb_build_object(''id'', x.id)), ''[]''::jsonb) FROM {{schema}}.records x WHERE x.id IN (SELECT v::uuid FROM jsonb_array_elements_text(coalesce(r.data->%L, ''[]''::jsonb)) AS t(v))))', ename, ename);
     ELSE
       RAISE EXCEPTION USING ERRCODE = 'MD003', MESSAGE = format('%s is not a relation field', ename);
     END IF;
@@ -358,7 +394,7 @@ BEGIN
 
   sql := format(
     'SELECT coalesce(jsonb_agg(row ORDER BY ord), ''[]''::jsonb) FROM (
-       SELECT jsonb_build_object(''id'', r.id, ''created_at'', r.created_at, ''updated_at'', r.updated_at) || r.data %s AS row,
+       SELECT r.data %s || jsonb_build_object(''id'', r.id, ''created_at'', r.created_at, ''updated_at'', r.updated_at) AS row,
               row_number() OVER (ORDER BY %s) AS ord,
               jsonb_build_array(%s) AS keyset
        FROM {{schema}}.records r
@@ -366,10 +402,10 @@ BEGIN
        ORDER BY %s
        LIMIT %s) q',
     expand_sql,
-    array_to_string(sort_exprs, ' ' || dir || ', ') || ' ' || dir,
+    array_to_string(sort_exprs, ' ' || dir || ' ' || nulls_sql || ', ') || ' ' || dir || ' ' || nulls_sql,
     array_to_string(sort_exprs, ', '),
     where_sql, cursor_sql,
-    array_to_string(sort_exprs, ' ' || dir || ', ') || ' ' || dir,
+    array_to_string(sort_exprs, ' ' || dir || ' ' || nulls_sql || ', ') || ' ' || dir || ' ' || nulls_sql,
     lim + 1);
   EXECUTE sql INTO rows USING params;
 
@@ -404,7 +440,7 @@ BEGIN
   FOR d IN SELECT * FROM jsonb_array_elements(docs) LOOP
     PERFORM {{schema}}._validate_doc(d, meta.fields);
     INSERT INTO {{schema}}.records (collection_id, tenant_id, data)
-      VALUES (cid, meta.tenant_id, jsonb_strip_nulls(d)) RETURNING id INTO newid;
+      VALUES (cid, meta.tenant_id, {{schema}}._strip_top_nulls(d)) RETURNING id INTO newid;
     ids := ids || newid;
   END LOOP;
   PERFORM {{schema}}._bump_usage(meta.database_id, meta.tenant_id, 0, array_length(ids, 1), 0);
@@ -420,7 +456,7 @@ BEGIN
   PERFORM {{schema}}._validate_doc(patch, meta.fields);
   SELECT coalesce(array_agg(key), '{}') INTO nulls FROM jsonb_each(patch) WHERE jsonb_typeof(value) = 'null';
   UPDATE {{schema}}.records r
-     SET data = (r.data || jsonb_strip_nulls(patch)) - nulls, updated_at = now()
+     SET data = (r.data || {{schema}}._strip_top_nulls(patch)) - nulls, updated_at = now()
    WHERE r.id = rid AND r.collection_id = cid;
   IF NOT FOUND THEN
     RAISE EXCEPTION USING ERRCODE = 'MD006', MESSAGE = 'record not found';
@@ -445,11 +481,12 @@ LANGUAGE plpgsql AS $$
 DECLARE n int;
 BEGIN
   INSERT INTO {{schema}}.usage_snapshot (database_id, tenant_id, day, bytes, records)
-  SELECT c.database_id, c.tenant_id, current_date,
+  SELECT d.id, d.tenant_id, current_date,
          coalesce(sum(pg_column_size(r.data)), 0), count(r.id)
-    FROM {{schema}}.collections c
+    FROM {{schema}}.databases d
+    LEFT JOIN {{schema}}.collections c ON c.database_id = d.id
     LEFT JOIN {{schema}}.records r ON r.collection_id = c.id
-   GROUP BY c.database_id, c.tenant_id
+   GROUP BY d.id, d.tenant_id
   ON CONFLICT (database_id, day) DO UPDATE SET bytes = EXCLUDED.bytes, records = EXCLUDED.records;
   GET DIAGNOSTICS n = ROW_COUNT;
   RETURN n;

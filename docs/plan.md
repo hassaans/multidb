@@ -97,9 +97,14 @@ one Codex review per PR.
 ## Progress
 
 - ✅ Phase 1 bootstrap; CI green on hosted Actions.
-- 🚧 Phase 2 tests-first PR #1 open: 27 tests over the embedded Postgres harness, CI
-  green except the test step. 13 red by design: bad collection id, null-sort pagination
-  asc/desc, statement timeout clobbered, Delete encoding (two tests), parent ownership,
-  empty tenant, duplicate-name conflicts, reserved field names, sort by json, nested
-  nulls, stale snapshot. Codex reviewed once (6 findings, all turned into tests).
-  Awaiting owner validation before fixes.
+- ✅ Phase 2 tests first (PR #1): 27 tests over the embedded Postgres harness, 13 red by
+  design. Codex reviewed once (6 findings, all turned into tests). Tests validated by the
+  owner on 25 Oct; decisions: empty tenant id is refused with `ErrForbidden`, schema
+  fixes edit `001_init.sql` in place since nothing is released.
+- ✅ Phase 3 fixes (same PR): every defect above fixed, suite green with `-race`.
+  Composite tenant-inclusive foreign keys, `current_tenant()` returns NULL for blank
+  settings, reserved metadata names, null-safe keyset predicate with explicit NULLS
+  ordering, json sort rejected, top-level-only null stripping, snapshot from databases,
+  `query()` no longer overrides the caller's `statement_timeout`, one round trip for the
+  per-transaction settings, `Delete` sends ids as `text[]` with a cast, and SQLSTATEs
+  23505/23503/23514/42501 map to `ErrConflict`/`ErrNotFound`/`ErrBadSpec`/`ErrForbidden`.
