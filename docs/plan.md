@@ -29,7 +29,29 @@ Each becomes a failing test first, then a fix.
 - `ErrQuota` / SQLSTATE `MD005` exists but nothing enforces quotas (v0.2).
 - `expand` and relation validation never check the target collection in field options (v0.2).
 - Module path, Go version and pgx are stale. Target Go 1.26 and pgx v5.11.
+- `Tenant.Delete` never worked: under `QueryExecModeExec` (required behind a transaction-mode
+  pooler) pgx cannot encode `[]uuid.UUID` as `uuid[]` without a prepared statement. Found by
+  the new suite; the v0 tests never called Delete.
 - All tests skip without a test DSN, so `go test ./...` passes vacuously on a fresh clone.
+
+Found by Codex's review of PR #1 (each also has a red test):
+
+- **Parent ownership (P1).** Foreign keys are checked as the table owner and ignore RLS,
+  so tenant B can create collections under A's database and fields on A's collections.
+  Fix: tenant-inclusive composite foreign keys.
+- **Empty tenant (P1).** On plain Postgres `current_tenant()` returns `''` for an empty
+  `app.tenant_id`, which makes `''` a shared namespace. Fix: `nullif`, plus the Go side
+  refuses an empty tenant id with `ErrForbidden`.
+- Document fields named `id`, `created_at` or `updated_at` overwrite record metadata in
+  results and break cursors. Fix: reserve the names and keep metadata authoritative.
+- Sorting by a `json`/`relation_many` field works for one page and fails on the next
+  (jsonb vs text keyset). Fix: reject with `ErrTypeMismatch`.
+- `jsonb_strip_nulls` is recursive, so nulls nested inside `json` values are lost on
+  write. Fix: strip top-level nulls only.
+- `snapshot_usage()` starts from collections, so a database whose collections were all
+  deleted keeps its stale snapshot. Fix: start from databases.
+- Unique violations, check violations and RLS refusals surface as raw Postgres errors.
+  Fix: map to `ErrConflict`, `ErrBadSpec` and `ErrForbidden`.
 - README and the HTTP example are specific to the original host project.
 
 ### Layout
@@ -55,12 +77,14 @@ a test that defines a stub `auth.uid()` and a role named `authenticated`.
 
 1. **Bootstrap** (this commit): license, README stub, module, Makefile, lint config,
    CI on `ubuntu-latest`, this plan.
-2. **Tests first** (PR): port the five existing tests onto the harness; add regression
+2. **Tests first** (PR #1): port the five existing tests onto the harness; add regression
    tests for each defect above, plus concurrent `Ensure` callers, the Supabase role
-   path, cursors over null sort values and a golden file for `cmd/multidb-sql`. The v0
-   library is ported unchanged in the same PR so the suite compiles; the new tests are
-   red. Stop and ask the owner to validate the tests.
-3. **Fixes** (PR): fix the defects until the suite is green and `golangci-lint` is clean.
+   path and cursors over null sort values. The v0 library is ported with only the
+   rename and lint-driven `errors.Is` changes so the suite compiles; the defect tests
+   are red. Stop and ask the owner to validate the tests.
+3. **Fixes** (same PR, after validation): fix the defects until the suite is green, so
+   `main` never carries a red build. The `cmd/multidb-sql` golden test arrives with the
+   command in phase 4.
 4. **Examples and docs** (PR): generalize the HTTP example behind an `Authenticator`
    interface; write `docs/spec.md` (query contract v1), `docs/supabase.md` (pooler,
    roles, `rpc()`), `docs/security.md` (RLS model, never query as superuser);
@@ -72,4 +96,15 @@ one Codex review per PR.
 
 ## Progress
 
-- ✅ Phase 1 bootstrap.
+- ✅ Phase 1 bootstrap; CI green on hosted Actions.
+- ✅ Phase 2 tests first (PR #1): 27 tests over the embedded Postgres harness, 13 red by
+  design. Codex reviewed once (6 findings, all turned into tests). Tests validated by the
+  owner on 25 Oct; decisions: empty tenant id is refused with `ErrForbidden`, schema
+  fixes edit `001_init.sql` in place since nothing is released.
+- ✅ Phase 3 fixes (same PR): every defect above fixed, suite green with `-race`.
+  Composite tenant-inclusive foreign keys, `current_tenant()` returns NULL for blank
+  settings, reserved metadata names, null-safe keyset predicate with explicit NULLS
+  ordering, json sort rejected, top-level-only null stripping, snapshot from databases,
+  `query()` no longer overrides the caller's `statement_timeout`, one round trip for the
+  per-transaction settings, `Delete` sends ids as `text[]` with a cast, and SQLSTATEs
+  23505/23503/23514/42501 map to `ErrConflict`/`ErrNotFound`/`ErrBadSpec`/`ErrForbidden`.
